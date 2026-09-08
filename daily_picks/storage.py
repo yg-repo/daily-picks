@@ -49,11 +49,14 @@ CREATE TABLE IF NOT EXISTS digest_runs (
 );
 
 CREATE TABLE IF NOT EXISTS digest_items (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    digest_id   INTEGER NOT NULL REFERENCES digest_runs(id),
-    article_id  INTEGER NOT NULL REFERENCES articles(id),
-    rank        INTEGER NOT NULL,
-    llm_reason  TEXT,
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    digest_id    INTEGER NOT NULL REFERENCES digest_runs(id),
+    article_id   INTEGER NOT NULL REFERENCES articles(id),
+    rank         INTEGER NOT NULL,
+    llm_reason   TEXT,
+    deep_score   INTEGER,          -- v3 deep 评分（2026-09-04 加列：DeepResult 落库可审计）
+    deep_keywords TEXT,            -- JSON 数组（deep 关键词，校验后）
+    deep_reason  TEXT,             -- deep 推荐理由
     UNIQUE(digest_id, article_id)
 );
 
@@ -149,13 +152,23 @@ class Storage:
     # ---- 公共 API ----
 
     def init_schema(self) -> None:
-        """执行 §5 全部 DDL（幂等）。"""
+        """执行 §5 全部 DDL（幂等）；老库 ALTER 补 v3 加列（2026-09-04）。"""
         with self._lock:
             try:
                 self._conn.executescript(_SCHEMA)
+                self._migrate_digest_items_columns()
                 self._conn.commit()
             except sqlite3.Error as e:
                 raise StorageError(f"初始化 schema 失败: {e}") from e
+
+    def _migrate_digest_items_columns(self) -> None:
+        """digest_items 缺 deep_* 列（v3 前建的老库）时 ALTER 补齐。"""
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(digest_items)")}
+        for col, ddl in (("deep_score", "INTEGER"),
+                         ("deep_keywords", "TEXT"),
+                         ("deep_reason", "TEXT")):
+            if col not in cols:
+                self._conn.execute(f"ALTER TABLE digest_items ADD COLUMN {col} {ddl}")
 
     def upsert_articles(self, articles: list[Article]) -> list[int]:
         """INSERT OR IGNORE 按 (source, source_key) 与 content_hash 去重；返回【新插入】的 article id 列表。"""
@@ -245,6 +258,22 @@ class Storage:
                 (picked_count, pushed, channel, tokens_in, tokens_out,
                  cost_usd, int(fallback_used), run_id),
             )
+
+    def update_digest_deep(self, digest_id: int, article_id: int, *,
+                           deep_score: int | None, keywords: list[str],
+                           deep_reason: str | None) -> None:
+        """写回 deep 分析结果到 digest_items（2026-09-04：DeepResult 落库可审计）。"""
+        with self._lock:
+            try:
+                self._conn.execute(
+                    "UPDATE digest_items SET deep_score=?, deep_keywords=?, deep_reason=?"
+                    " WHERE digest_id=? AND article_id=?",
+                    (deep_score, json.dumps(keywords, ensure_ascii=False), deep_reason,
+                     digest_id, article_id),
+                )
+                self._conn.commit()
+            except sqlite3.Error as e:
+                raise StorageError(f"写回 deep 结果失败: {e}") from e
 
     def add_digest_items(self, digest_id: int, picks: list[Pick]) -> None:
         """写入精选条目（UNIQUE(digest_id, article_id)，重复忽略）。"""

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from daily_picks import deep as deep_mod
 from daily_picks.deep import deep_analyze, deep_filter, format_keywords
 from daily_picks.models import Article, ScoredArticle
@@ -21,7 +23,11 @@ def make_scored(article_id: int = 1, title: str = "AI 编程工具实战",
 
 
 class FakeSeqLLM:
-    """按调用顺序返回预置 JSON 文本；记录 user 消息与并发度（T-DEEP-08 用）。"""
+    """按调用顺序返回预置 JSON 文本；记录 user 消息与并发度（T-DEEP-08 用）。
+
+    2026-09-04：回复序号在进入时用 lock 顺序分配（并发 sleep 后分配会竞态错位——
+    deep_filter 加共享 httpx client 后暴露，导致回复与 candidate 错位）。
+    """
 
     def __init__(self, replies: list[str]):
         self.replies = list(replies)
@@ -29,20 +35,23 @@ class FakeSeqLLM:
         self.active = 0
         self.max_active = 0
         self.users: list[str] = []
+        self._lock = asyncio.Lock()
 
     async def chat(self, system: str, user: str, json_mode: bool = True) -> str:
+        async with self._lock:
+            idx = self.calls
+            self.calls += 1
         self.active += 1
         self.max_active = max(self.max_active, self.active)
         try:
             await asyncio.sleep(0.01)
             self.users.append(user)
-            return self.replies[min(self.calls, len(self.replies) - 1)]
+            return self.replies[min(idx, len(self.replies) - 1)]
         finally:
-            self.calls += 1
             self.active -= 1
 
 
-VALID_JSON = ('{"deep_score": 78, "keywords": ["A", "B", "C"],'
+VALID_JSON = ('{"deep_score": 78, "keywords": ["AI", "编程", "代码"],'
               ' "reason": "文中用具体数据对比了三种方案，缓存实测尤其有参考价值。"}')
 
 
@@ -53,35 +62,35 @@ class TestDeepAnalyze:
         result = await deep_analyze(make_article(), llm, {"AI": 2.0})
         assert result.deep_score == 78
         assert result.ok is True
-        assert result.keywords == ["A", "B", "C"]
+        assert result.keywords == ["AI", "编程", "代码"]
         assert "AI" in llm.users[0] and result.reason  # 兴趣关键词注入 user 消息 + 输出完整
 
     # T-DEEP-02 评分越界回退
     async def test_score_out_of_range(self):
-        llm = FakeSeqLLM(['{"deep_score": 150, "keywords": ["A", "B", "C"], "reason": "r"}'])
+        llm = FakeSeqLLM(['{"deep_score": 150, "keywords": ["AI", "编程", "代码"], "reason": "r"}'])
         result = await deep_analyze(make_article(), llm, {})
         assert result.ok is False
 
     async def test_score_non_numeric(self):
-        llm = FakeSeqLLM(['{"deep_score": "78", "keywords": ["A", "B", "C"], "reason": "r"}'])
+        llm = FakeSeqLLM(['{"deep_score": "78", "keywords": ["AI", "编程", "代码"], "reason": "r"}'])
         result = await deep_analyze(make_article(), llm, {})
         assert result.ok is False
 
     # T-DEEP-03 关键词不足
     async def test_keywords_too_few_keeps_original(self):
-        llm = FakeSeqLLM(['{"deep_score": 60, "keywords": ["A"], "reason": "r"}'])
+        llm = FakeSeqLLM(['{"deep_score": 60, "keywords": ["代码"], "reason": "r"}'])
         result = await deep_analyze(make_article(), llm, {})
         assert result.ok is False
-        assert result.keywords == ["A"]  # 保留原值
+        assert result.keywords == ["代码"]  # 数量不足（<3）但原文命中，保留原值
 
     # T-DEEP-04 理由含禁用词
     async def test_banned_reason_word(self):
-        llm = FakeSeqLLM(['{"deep_score": 80, "keywords": ["A", "B", "C"], "reason": "本文深入浅出"}'])
+        llm = FakeSeqLLM(['{"deep_score": 80, "keywords": ["AI", "编程", "代码"], "reason": "本文深入浅出"}'])
         result = await deep_analyze(make_article(), llm, {})
         assert result.ok is False
 
     async def test_empty_reason_falls_back(self):
-        llm = FakeSeqLLM(['{"deep_score": 80, "keywords": ["A", "B", "C"], "reason": ""}'])
+        llm = FakeSeqLLM(['{"deep_score": 80, "keywords": ["Rust", "异步", "实战"], "reason": ""}'])
         result = await deep_analyze(make_article(title="Rust 异步实战"), llm, {})
         assert result.ok is True  # 回退文案，非失败
         assert "Rust 异步实战" in result.reason
@@ -96,11 +105,20 @@ def _replies(scores: list[int], extra: str = "") -> list[str]:
     out = []
     for s in scores:
         # R12: brief 原 % 格式化触发 UP031（brief 自要求 ruff 零告警），改 f-string 输出等价
-        out.append(f'{{"deep_score": {s}, "keywords": ["A", "B", "C"], "reason": "文中引用具体数据论证观点{extra}"}}')
+        out.append(f'{{"deep_score": {s}, "keywords": ["AI", "编程", "代码"], "reason": "文中引用具体数据论证观点{extra}"}}')
     return out
 
 
 class TestDeepFilter:
+    @pytest.fixture(autouse=True)
+    def _no_network_fetch(self, monkeypatch):
+        """屏蔽 deep_filter 的正文抓取真实网络请求（2026-09-04 起 deep_filter 自带 httpx client）。"""
+
+        async def _no_body(*args, **kwargs):
+            return ""
+
+        monkeypatch.setattr(deep_mod, "fetch_article_text", _no_body)
+
     # T-DEEP-05 批量过滤保高分
     async def test_keeps_high_scores(self):
         llm = FakeSeqLLM(_replies([78, 55, 30]))
@@ -149,9 +167,9 @@ class TestDeepFilter:
         seen: list[dict[str, float]] = []
         original = deep_mod.deep_analyze
 
-        async def spy(article, llm, weights):
+        async def spy(article, llm, weights, client=None):
             seen.append(weights)
-            return await original(article, llm, weights)
+            return await original(article, llm, weights, client)
 
         monkeypatch.setattr(deep_mod, "deep_analyze", spy)
         await deep_filter([make_scored(article_id=1)], FakeSeqLLM([VALID_JSON]),
@@ -211,7 +229,7 @@ def llm_reply(content: str) -> httpx.Response:
     return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
 
 
-DEEP_JSON = ('{"deep_score": 70, "keywords": ["AI", "大模型", "深度思考"],'
+DEEP_JSON = ('{"deep_score": 70, "keywords": ["AI", "编程", "代码"],'
              ' "reason": "文章用具体数据对比了三种方案的落地成本，缓存实测尤其有参考价值。"}')
 RANK_JSON = ('{"picks": [{"article_id": 1, "rank": 1, "reason": "AI主题深度"},'
              ' {"article_id": 2, "rank": 2, "reason": "工具链实测"},'
@@ -219,6 +237,15 @@ RANK_JSON = ('{"picks": [{"article_id": 1, "rank": 1, "reason": "AI主题深度"
 
 
 class TestRunOnceV3:
+    @pytest.fixture(autouse=True)
+    def _no_network_fetch(self, monkeypatch):
+        """屏蔽 deep_filter 的正文抓取真实网络请求（2026-09-04 起 deep_filter 自带 httpx client）。"""
+
+        async def _no_body(*args, **kwargs):
+            return ""
+
+        monkeypatch.setattr(deep_mod, "fetch_article_text", _no_body)
+
     async def test_v3_deep_path_outputs_v3_digest(self, sample_config, tmp_path, mock_http,
                                                   frozen_now, monkeypatch):
         cfg = sample_config
@@ -235,7 +262,7 @@ class TestRunOnceV3:
         assert await run_once(cfg, dry_run=True) == 0
         text = Path(cfg.push.dry_run_file).read_text(encoding="utf-8")
         assert text.startswith("📚 今日深度精选（3条）")
-        assert "关键词：AI、大模型、深度思考" in text
+        assert "关键词：AI、编程、代码" in text
         assert "推荐理由：文章用具体数据" in text
         assert text.count("关键词：") == 3
 
@@ -252,3 +279,82 @@ class TestRunOnceV3:
         text = Path(cfg.push.dry_run_file).read_text(encoding="utf-8")
         assert "📚 今日深度精选" in text  # 模板仍是 v3（profile.enabled）
         assert "摘要：" in text or "今日无精选内容" in text  # deep 缺位 → 摘要兜底
+
+
+class TestKeywordValidation:
+    """可验证校验（T-DEEP-11，2026-09-04 修复：LLM 编造关键词防护）。"""
+
+    def test_fabricated_all_removed(self):
+        # 关键词全部不在原文 → 清空（推送模板走摘要兜底）
+        result = deep_mod._validate_keywords(["上下文窗口", "外部记忆"], "标题：AI 编程\n摘要：写代码")
+        assert result == []
+
+    def test_fabricated_partially_filtered(self):
+        result = deep_mod._validate_keywords(["AI", "不存在的词", "代码"], "标题：AI 编程\n摘要：写代码")
+        assert result == ["AI", "代码"]  # 只保留原文命中项
+
+    def test_empty_and_non_string_ignored(self):
+        result = deep_mod._validate_keywords(["", None, "AI"], "标题：AI 编程")
+        assert result == ["AI"]
+
+
+class TestFetchBody:
+    """正文抓取与清洗（docs/04 §6.2，2026-09-04 修复）。"""
+
+    def test_strip_html(self):
+        raw = "<html><head><style>.x{}</style></head><body><p>正文内容</p><script>bad()</script><nav>菜单</nav>结尾</body></html>"
+        text = deep_mod._strip_html(raw)
+        assert "正文内容" in text and "结尾" in text
+        assert "bad" not in text and "菜单" not in text and "{" not in text
+
+    def test_strip_html_entities(self):
+        assert deep_mod._strip_html("<p>a &amp; b</p>") == "a & b"
+
+    async def test_fetch_html_success_and_truncate(self):
+        transport = httpx.MockTransport(lambda req: httpx.Response(200, text="<html><body><p>" + "字" * 5000 + "</p></body></html>", headers={"content-type": "text/html"}))
+        async with httpx.AsyncClient(transport=transport) as client:
+            text = await deep_mod.fetch_article_text("https://example.com/x", client, max_chars=100)
+            assert len(text) == 100
+
+    async def test_fetch_non_html_returns_empty(self):
+        transport = httpx.MockTransport(lambda req: httpx.Response(200, text="{}", headers={"content-type": "application/json"}))
+        async with httpx.AsyncClient(transport=transport) as client:
+            assert await deep_mod.fetch_article_text("https://example.com/x", client) == ""
+
+    async def test_fetch_error_returns_empty(self):
+        transport = httpx.MockTransport(lambda req: httpx.Response(500))
+        async with httpx.AsyncClient(transport=transport) as client:
+            assert await deep_mod.fetch_article_text("https://example.com/x", client) == ""
+
+    async def test_short_summary_triggers_body_fetch_and_body_used(self, monkeypatch):
+        """summary < 200 字且传 client → 抓正文，DeepResult.body_used=True。"""
+        calls = {"n": 0}
+
+        async def fake_fetch(url, client, **kw):
+            calls["n"] += 1
+            return "正文包含 AI 编程 代码 详细讲解"
+
+        monkeypatch.setattr(deep_mod, "fetch_article_text", fake_fetch)
+        llm = FakeSeqLLM([VALID_JSON])
+        article = make_article(summary="短摘要")  # < 200 字
+        transport = httpx.MockTransport(lambda req: httpx.Response(200))
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await deep_analyze(article, llm, {"AI": 2.0}, client)
+        assert calls["n"] == 1
+        assert result.body_used is True
+        assert "正文包含" in llm.users[0]  # 正文进入 user prompt
+
+    async def test_long_summary_skips_fetch(self, monkeypatch):
+        calls = {"n": 0}
+
+        async def fake_fetch(url, client, **kw):
+            calls["n"] += 1
+            return "x"
+
+        monkeypatch.setattr(deep_mod, "fetch_article_text", fake_fetch)
+        llm = FakeSeqLLM([VALID_JSON])
+        article = make_article(summary="长" * 300)  # ≥ 200 字不抓
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200))) as client:
+            result = await deep_analyze(article, llm, {"AI": 2.0}, client)
+        assert calls["n"] == 0
+        assert result.body_used is False

@@ -587,6 +587,17 @@ async def run_once(cfg: RootConfig, dry_run: bool = False) -> int:
 
     # 精选条目落库（设计文档 §4.2 步骤 7）
     storage.add_digest_items(run_id, picks)
+    # v3：deep 分析结果写回 digest_items（可审计，2026-09-04）
+    if deep_map_full:
+        for pk in picks:
+            dr = deep_map_full.get(pk.article_id)
+            if dr is not None:
+                storage.update_digest_deep(
+                    run_id, pk.article_id,
+                    deep_score=dr.deep_score if dr.ok else None,
+                    keywords=dr.keywords,
+                    deep_reason=dr.reason or None,
+                )
 
     # 步骤 10：finish_digest_run 记账（picked/pushed/channel/token/cost/fallback）
     tokens_in = llm_client.last_tokens_in
