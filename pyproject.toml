@@ -36,6 +36,7 @@ dev = [
     "pytest-cov>=7.1.0",
     "respx>=0.23.1",
     "ruff>=0.16.4",
+    "socksio>=1.0.0",
 ]
 
 [project.scripts]
