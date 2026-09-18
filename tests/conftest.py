@@ -52,3 +52,20 @@ def frozen_now():
     """
     with freeze_time("2026-08-27 08:00:00", tz_offset=8, real_asyncio=True):
         yield datetime(2026, 8, 27, 8, 0, 0)
+
+@pytest.fixture(autouse=True)
+def _hermetic_env(monkeypatch):
+    """统一测试环境（2026-09-18 CI 修复）：
+
+    ① 固定时区 Asia/Shanghai——run_date 由 datetime.now().astimezone(tz) 生成，
+       CI runner 为 UTC 时日期会漂移一天（如冻结 08-27 变成 08-28），导致日期断言失败；
+    ② 清除代理环境变量——httpx 默认 trust_env=True，本机 all_proxy(socks5) 与
+       CI 无代理的差异会让 respx 拦截路径不一致（未拦截时真实请求打到企业微信，
+       返回 errcode 93000 造成"本地过、CI 挂"）。
+    """
+    import time as _time
+    monkeypatch.setenv("TZ", "Asia/Shanghai")
+    _time.tzset()
+    for k in ("all_proxy", "ALL_PROXY", "http_proxy", "HTTP_PROXY",
+              "https_proxy", "HTTPS_PROXY", "no_proxy", "NO_PROXY"):
+        monkeypatch.delenv(k, raising=False)
