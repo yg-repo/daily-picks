@@ -19,19 +19,10 @@ jobs:
       - name: pytest
         run: |
           set -o pipefail
-          uv run pytest --cov --cov-report=term-missing --cov-fail-under=85 -x --tb=short 2>&1 | tee pytest.log
-      - name: 失败诊断（写入 job summary）
+          uv run pytest --cov --cov-report=term-missing --cov-fail-under=85 -q --tb=short 2>&1 | tee pytest.log
+      - name: 失败诊断（输出为 annotation，API 可读）
         if: failure()
         run: |
-          {
-            echo '## pytest 失败详情'
-            echo '```'
-            tail -n 120 pytest.log
-            echo '```'
-            echo '## 环境信息'
-            echo '```'
-            uv --version
-            python --version
-            uname -a
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error title=FAILED_CASES::$(grep -E '^(FAILED|ERROR)' pytest.log | head -5 | tr '\n' '|')"
+          echo "::error title=PYTEST_TAIL::$(tail -c 1200 pytest.log | tr '\n' '~')"
+          echo "::notice title=ENV::$(uv --version) $(python --version 2>&1) $(uname -sr)"
