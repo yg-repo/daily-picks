@@ -1,6 +1,6 @@
 # DailyPicks（今日精选）
 
-[![CI](https://github.com/pzh-ops/daily-picks/actions/workflows/ci.yml/badge.svg)](https://github.com/pzh-ops/daily-picks/actions/workflows/ci.yml)
+[![CI](https://github.com/yg-repo/daily-picks/actions/workflows/ci.yml/badge.svg)](https://github.com/yg-repo/daily-picks/actions/workflows/ci.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
@@ -147,7 +147,7 @@ tracking:
 要求：Python 3.11 + [uv](https://docs.astral.sh/uv/)。
 
 ```bash
-git clone git@github.com:pzh-ops/daily-picks.git && cd daily-picks
+git clone git@github.com:yg-repo/daily-picks.git && cd daily-picks
 uv sync                                  # 安装依赖
 
 cp .env.example .env                     # 填入 DEEPSEEK_API_KEY（推送 key 可选）

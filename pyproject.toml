@@ -43,9 +43,9 @@ dev = [
 daily-picks = "daily_picks.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/pzh-ops/daily-picks"
-Repository = "https://github.com/pzh-ops/daily-picks"
-Documentation = "https://github.com/pzh-ops/daily-picks/tree/main/docs"
+Homepage = "https://github.com/yg-repo/daily-picks"
+Repository = "https://github.com/yg-repo/daily-picks"
+Documentation = "https://github.com/yg-repo/daily-picks/tree/main/docs"
 
 [build-system]
 requires = ["hatchling"]
